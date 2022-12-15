@@ -29,12 +29,17 @@
 #include "asm/register.hpp"
 
 enum class StorageType : int8_t {
-  STACK = 0,
-  PLACEHOLDER = 1,
+  INTEGER = 0,
+  FLOAT = 1,
+  STACK = 2,
+  PLACEHOLDER = 3,
 // special locations used only by native code
   FRAME_DATA = PLACEHOLDER + 1,
   INVALID = -1
 };
+
+constexpr uint16_t REG64_MASK = 0b0000000000000001;
+constexpr uint16_t FP_MASK    = 0b0000000000000001;
 
 // need to define this before constructing VMStorage (below)
 constexpr inline bool VMStorage::is_reg(StorageType type) {
