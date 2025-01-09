@@ -35,7 +35,6 @@ import compiler.lib.ir_framework.*;
  * @summary Test that Ideal transformations of ModINode* are being performed as expected.
  * @library /test/lib /
  * @run driver compiler.c2.irTests.ModINodeIdealizationTests
- * @requires os.arch != "riscv64"
  */
 public class ModINodeIdealizationTests {
     public static final int RANDOM_POWER_OF_2 = 1 << (1 + Utils.getRandomInstance().nextInt(30));
@@ -122,8 +121,10 @@ public class ModINodeIdealizationTests {
     }
 
     @Test
-    @IR(failOn = {IRNode.MOD_I})
-    @IR(counts = {IRNode.AND_I, ">=1", IRNode.RSHIFT, ">=1", IRNode.CMP_I, "2"})
+    @IR(applyIfPlatform = {"riscv64", "false"},
+        failOn = {IRNode.MOD_I})
+    @IR(applyIfPlatform = {"riscv64", "false"},
+        counts = {IRNode.AND_I, ">=1", IRNode.RSHIFT, ">=1", IRNode.CMP_I, "2"})
     // Special optimization for the case 2^k-1 for bigger k
     public int powerOf2Minus1(int x) {
         return x % 127;
