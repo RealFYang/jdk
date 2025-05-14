@@ -64,6 +64,15 @@ class InterpreterMacroAssembler: public MacroAssembler {
                            Register arg_1);
   void restore_after_resume(bool is_native);
 
+  void call_VM_with_sender_Java_fp_entry(address entry_point);
+
+  void set_last_Java_frame_with_sender_fp(Register last_java_sp,
+                                          Register last_java_fp,
+                                          address last_java_pc,
+                                          Register tmp_reg);
+
+  void reset_last_Java_frame_with_sender_fp(Register fp_reg);
+
   void jump_to_entry(address entry);
 
   virtual void check_and_handle_popframe(Register java_thread);
@@ -71,7 +80,11 @@ class InterpreterMacroAssembler: public MacroAssembler {
 
   // Interpreter-specific registers
   void save_bcp() {
-    sd(xbcp, Address(fp, frame::interpreter_frame_bcp_offset * wordSize));
+    save_bcp(fp);
+  }
+
+  void save_bcp(Register fp_reg) {
+    sd(xbcp, Address(fp_reg, frame::interpreter_frame_bcp_offset * wordSize));
   }
 
   void restore_bcp() {
@@ -217,6 +230,8 @@ class InterpreterMacroAssembler: public MacroAssembler {
                          bool throw_monitor_exception = true,
                          bool install_monitor_exception = true,
                          bool notify_jvmdi = true);
+
+  void make_sender_fp_current(Register save_this_fp, Register tmp_reg);
 
   // FIXME: Give us a valid frame at a null check.
   virtual void null_check(Register reg, int offset = -1) {

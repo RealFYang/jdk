@@ -41,6 +41,7 @@
 #include "prims/jvmtiExport.hpp"
 #include "prims/jvmtiThreadState.hpp"
 #include "runtime/basicLock.hpp"
+#include "runtime/continuationEntry.hpp"
 #include "runtime/frame.inline.hpp"
 #include "runtime/javaThread.hpp"
 #include "runtime/safepointMechanism.hpp"
@@ -495,11 +496,43 @@ void InterpreterMacroAssembler::dispatch_via(TosState state, address* table) {
   dispatch_base(state, table);
 }
 
+void InterpreterMacroAssembler::call_VM_with_sender_Java_fp_entry(address entry_point) {
+  mv(c_rarg0, xthread);
+  MacroAssembler::call_VM_leaf_base(entry_point, 0);
+}
+
+void InterpreterMacroAssembler::set_last_Java_frame_with_sender_fp(Register last_java_sp,
+                                                                   Register last_java_fp,
+                                                                   address last_java_pc,
+                                                                   Register tmp_reg) {
+  assert_different_registers(last_java_fp, fp);
+
+#if INCLUDE_JFR
+  Label L_ljf, L_valid_fp;
+  bnez(fp, L_valid_fp);
+  mv(tmp_reg, 1);
+  sd(tmp_reg, Address(xthread, JavaThread::last_sender_Java_fp_offset()));
+  j(L_ljf);
+  bind(L_valid_fp);
+  sd(fp, Address(xthread, JavaThread::last_sender_Java_fp_offset()));
+  bind(L_ljf);
+#endif
+
+  set_last_Java_frame(last_java_sp, last_java_fp, last_java_pc, tmp_reg);
+}
+
+void InterpreterMacroAssembler::reset_last_Java_frame_with_sender_fp(Register fp_reg) {
+  // Restore the fp_reg.
+  ld(fp_reg, Address(xthread, JavaThread::last_Java_fp_offset()));
+  reset_last_Java_frame(true);
+  JFR_ONLY(sd(zr, Address(xthread, JavaThread::last_sender_Java_fp_offset()));)
+}
+
 // remove activation
 //
-// Apply stack watermark barrier.
 // Unlock the receiver if this is a synchronized method.
 // Unlock any Java monitors from synchronized blocks.
+// Apply stack watermark barrier.
 // Remove the activation from the stack.
 //
 // If there are locked Java monitors
@@ -509,31 +542,13 @@ void InterpreterMacroAssembler::dispatch_via(TosState state, address* table) {
 //       installs IllegalMonitorStateException
 //    Else
 //       no error processing
-void InterpreterMacroAssembler::remove_activation(
-                                TosState state,
-                                bool throw_monitor_exception,
-                                bool install_monitor_exception,
-                                bool notify_jvmdi) {
+void InterpreterMacroAssembler::remove_activation(TosState state,
+                                                  bool throw_monitor_exception,
+                                                  bool install_monitor_exception,
+                                                  bool notify_jvmdi) {
   // Note: Registers x13 may be in use for the
   // result check if synchronized method
   Label unlocked, unlock, no_unlock;
-
-  // The below poll is for the stack watermark barrier. It allows fixing up frames lazily,
-  // that would normally not be safe to use. Such bad returns into unsafe territory of
-  // the stack, will call InterpreterRuntime::at_unwind.
-  Label slow_path;
-  Label fast_path;
-  safepoint_poll(slow_path, true /* at_return */, false /* acquire */, false /* in_nmethod */);
-  j(fast_path);
-
-  bind(slow_path);
-  push(state);
-  set_last_Java_frame(esp, fp, (address)pc(), t0);
-  super_call_VM_leaf(CAST_FROM_FN_PTR(address, InterpreterRuntime::at_unwind), xthread);
-  reset_last_Java_frame(true);
-  pop(state);
-
-  bind(fast_path);
 
   // get the value of _do_not_unlock_if_synchronized into x13
   const Address do_not_unlock_if_synchronized(xthread,
@@ -689,16 +704,69 @@ void InterpreterMacroAssembler::remove_activation(
     bind(no_reserved_zone_enabling);
   }
 
-  // restore sender esp
-  mv(esp, t1);
+  // For asynchronous profiling to work correctly, we must remove the
+  // activation frame _before_ we test the method return safepoint poll.
+  // This is equivalent to how it is done for compiled frames.
+  // Removing an interpreter activation frame from a sampling perspective means
+  // updating the frame link. But since we are unwinding the current frame,
+  // we must save the current rfp in a temporary register, this_fp, for use
+  // as the last java fp should we decide to unwind.
+  // The asynchronous profiler will only see the updated fp, either using the
+  // CPU context or by reading the last_sender_Java_fp() field as part of the ljf.
+  const Register this_fp = t1;
+  make_sender_fp_current(this_fp, t0);
 
-  // remove frame anchor
-  leave();
+  // The interpreter frame is now unwound from a sampling perspective,
+  // meaning it sees the sender frame as the current frame from this point onwards.
+
+  // The below poll is for the stack watermark barrier. It allows fixing up frames lazily,
+  // that would normally not be safe to use. Such bad returns into unsafe territory of
+  // the stack, will call InterpreterRuntime::at_unwind.
+  Label slow_path;
+  Label fast_path;
+  safepoint_poll(slow_path, this_fp, true /* at_return */, false /* acquire */, false /* in_nmethod */);
+  j(fast_path);
+
+  bind(slow_path);
+  save_bcp(this_fp); // need to save bcp but not restore it.
+  push(state);
+  set_last_Java_frame_with_sender_fp(esp, this_fp, (address)pc(), t0);
+  call_VM_with_sender_Java_fp_entry(CAST_FROM_FN_PTR(address, InterpreterRuntime::at_unwind));
+  reset_last_Java_frame_with_sender_fp(this_fp);
+  pop(state);
+  bind(fast_path);
+
+  ld(esp, Address(this_fp, frame::interpreter_frame_sender_sp_offset * wordSize));
+  ld(ra, Address(this_fp, frame::return_addr_offset * wordSize));
+  la(sp, Address(this_fp, frame::sender_sp_offset * wordSize));
+
   // If we're returning to interpreted code we will shortly be
   // adjusting SP to allow some space for ESP.  If we're returning to
   // compiled code the saved sender SP was saved in sender_sp, so this
   // restores it.
   andi(sp, esp, -16);
+}
+
+void InterpreterMacroAssembler::make_sender_fp_current(Register save_this_fp, Register tmp_reg) {
+  const Register return_addr = save_this_fp;
+  const Register continuation_return_pc = tmp_reg;
+  const Register sender_sp = tmp_reg;
+
+  ld(return_addr, Address(fp, frame::return_addr_offset * wordSize)); // return address
+  // Load address of ContinuationEntry return pc
+  la(continuation_return_pc, ExternalAddress(ContinuationEntry::return_pc_address()));
+  // Load the ContinuationEntry return pc
+  ld(continuation_return_pc, Address(continuation_return_pc));
+
+  Label L_continuation, L_end;
+  mv(save_this_fp, fp); // Save current fp in temporary register.
+  beq(continuation_return_pc, return_addr, L_continuation);
+  ld(fp, Address(fp, frame::link_offset * wordSize)); // Update the frame link.
+  j(L_end);
+  bind(L_continuation);
+  la(sender_sp, Address(fp, frame::sender_sp_offset * wordSize));
+  ld(fp, Address(sender_sp, (int)(ContinuationEntry::size()))); // Update the frame link.
+  bind(L_end);
 }
 
 // Lock object

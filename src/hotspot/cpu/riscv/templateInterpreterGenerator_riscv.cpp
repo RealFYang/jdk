@@ -1384,10 +1384,41 @@ address TemplateInterpreterGenerator::generate_native_entry(bool synchronized) {
 
   __ jalr(result_handler);
 
-  // remove activation
-  __ ld(esp, Address(fp, frame::interpreter_frame_sender_sp_offset * wordSize)); // get sender sp
-  // remove frame anchor
-  __ leave();
+  // For asynchronous profiling to work correctly, we must remove the
+  // activation frame _before_ we test the method return safepoint poll.
+  // This is equivalent to how it is done for compiled frames.
+  // Removing an interpreter activation frame from a sampling perspective means
+  // updating the frame link (fp). But since we are unwinding the current frame,
+  // we must save the current rfp in a temporary register, this_fp, for use
+  // as the last java fp should we decide to unwind.
+  // The asynchronous profiler will only see the updated rfp, either using the
+  // CPU context or by reading the last_sender_Java_fp() field as part of the ljf.
+  const Register this_fp = t1;
+  __ make_sender_fp_current(this_fp, t0);
+
+  // The interpreter frame is now unwound from a sampling perspective,
+  // meaning it sees the sender frame as the current frame from this point onwards.
+
+  // The below poll is for the stack watermark barrier. It allows fixing up frames lazily,
+  // that would normally not be safe to use. Such bad returns into unsafe territory of
+  // the stack, will call InterpreterRuntime::at_unwind.
+  Label slow_path;
+  Label fast_path;
+  __ safepoint_poll(slow_path, this_fp, true /* at_return */, false /* acquire */, false /* in_nmethod */);
+  __ j(fast_path);
+
+  __ bind(slow_path);
+  __ push(dtos);
+  __ push(ltos);
+  __ set_last_Java_frame_with_sender_fp(esp, this_fp, (address)__ pc(), t0);
+  __ call_VM_with_sender_Java_fp_entry(CAST_FROM_FN_PTR(address, InterpreterRuntime::at_unwind));
+  __ reset_last_Java_frame_with_sender_fp(this_fp);
+  __ pop(ltos);
+  __ pop(dtos);
+  __ bind(fast_path);
+
+  __ ld(esp, Address(this_fp, frame::interpreter_frame_sender_sp_offset * wordSize));
+  __ ld(ra, Address(this_fp, frame::return_addr_offset * wordSize));
 
   // restore sender sp
   __ mv(sp, esp);
@@ -1634,6 +1665,7 @@ void TemplateInterpreterGenerator::generate_throw_exception() {
     Label caller_not_deoptimized;
     __ ld(c_rarg1, Address(fp, frame::return_addr_offset * wordSize));
     __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, InterpreterRuntime::interpreter_contains), c_rarg1);
+    __ restore_bcp();
     __ bnez(x10, caller_not_deoptimized);
 
     // Compute size of arguments for saving when returning to

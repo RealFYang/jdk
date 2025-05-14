@@ -1757,17 +1757,34 @@ void TemplateTable::branch(bool is_jsr, bool is_wide) {
 
     __ mv(x9, x10);                             // save the nmethod
 
-    call_VM(noreg, CAST_FROM_FN_PTR(address, SharedRuntime::OSR_migration_begin));
+    // For asynchronous profiling to work correctly, we must remove the
+    // activation frame _before_ we test the method return safepoint poll.
+    // This is equivalent to how it is done for compiled frames.
+    // Removing an interpreter activation frame from a sampling perspective means
+    // updating the frame link (fp). But since we are unwinding the current frame,
+    // we must save the current rfp in a temporary register, this_fp, for use
+    // as the last java fp should we decide to unwind.
+    // The asynchronous profiler will only see the updated rfp, either using the
+    // CPU context or by reading the last_sender_Java_fp() field as part of the ljf.
+    const Register this_fp = t1;
+    __ make_sender_fp_current(this_fp, t0);
+
+    // The interpreter frame is now unwound from a sampling perspective,
+    // meaning it sees the sender frame as the current frame from this point onwards.
+
+    __ save_bcp(this_fp); // need to save bcp but not restore it.
+    __ set_last_Java_frame_with_sender_fp(esp, this_fp, (address)__ pc(), t0);
+    __ call_VM_with_sender_Java_fp_entry(CAST_FROM_FN_PTR(address, SharedRuntime::OSR_migration_begin));
 
     // x10 is OSR buffer, move it to expected parameter location
     __ mv(j_rarg0, x10);
+    __ reset_last_Java_frame_with_sender_fp(this_fp);
 
     // remove activation
     // get sender esp
-    __ ld(esp,
-        Address(fp, frame::interpreter_frame_sender_sp_offset * wordSize));
-    // remove frame anchor
-    __ leave();
+    __ ld(esp, Address(this_fp, frame::interpreter_frame_sender_sp_offset * wordSize));
+    __ ld(ra, Address(this_fp, frame::return_addr_offset * wordSize));
+    __ la(sp, Address(this_fp, frame::sender_sp_offset * wordSize));
     // Ensure compiled code always sees stack at proper alignment
     __ andi(sp, esp, -16);
 
