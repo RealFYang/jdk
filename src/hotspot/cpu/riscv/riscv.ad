@@ -1066,6 +1066,10 @@ public:
 
 bool is_CAS(int opcode, bool maybe_volatile);
 
+// predicates controlling emit of fence before and after CAS
+bool unnecessary_acquire(const Node *barrier);
+bool unnecessary_release(const Node *barrier);
+
 // predicate controlling translation of CompareAndSwapX
 bool needs_acquiring_load_reserved(const Node *load);
 
@@ -1177,6 +1181,68 @@ bool is_CAS(int opcode, bool maybe_volatile)
     default:
       return false;
   }
+}
+
+// predicates controlling emit of fence before and after CAS
+
+bool unnecessary_acquire(const Node *barrier)
+{
+  assert(barrier->is_MemBar(), "expecting a membar");
+
+  MemBarNode* mb = barrier->as_MemBar();
+
+  if (mb->trailing_load_store()) {
+    Node* load_store = mb->in(MemBarNode::Precedent);
+    assert(load_store->is_LoadStore(), "unexpected graph shape");
+    switch(load_store->Opcode()) {
+      case Op_GetAndSetI:
+      case Op_GetAndSetL:
+      case Op_GetAndSetP:
+      case Op_GetAndSetN:
+      case Op_GetAndAddI:
+      case Op_GetAndAddL:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  return false;
+}
+
+bool unnecessary_release(const Node *n)
+{
+  assert((n->is_MemBar() &&
+          n->Opcode() == Op_MemBarRelease),
+          "expecting a release membar");
+
+  MemBarNode *barrier = n->as_MemBar();
+  if (!barrier->leading()) {
+    return false;
+  } else {
+    Node* trailing = barrier->trailing_membar();
+    MemBarNode* trailing_mb = trailing->as_MemBar();
+    assert(trailing_mb->trailing(), "Not a trailing membar?");
+    assert(trailing_mb->leading_membar() == n, "inconsistent leading/trailing membars");
+
+    Node* mem = trailing_mb->in(MemBarNode::Precedent);
+    if (!mem->is_Store()) {
+      assert(mem->is_LoadStore(), "");
+      assert(trailing_mb->Opcode() == Op_MemBarAcquire, "");
+      switch(mem->Opcode()) {
+        case Op_GetAndSetI:
+        case Op_GetAndSetL:
+        case Op_GetAndSetP:
+        case Op_GetAndSetN:
+        case Op_GetAndAddI:
+        case Op_GetAndAddL:
+          return true;
+        default:
+          return false;
+      }
+    }
+  }
+  return false;
 }
 
 constexpr uint64_t MAJIK_DWORD = 0xabbaabbaabbaabbaull;
@@ -8200,9 +8266,36 @@ instruct unnecessary_membar_volatile_rvtso() %{
 
 // RVWMO
 
-instruct membar_aqcuire_rvwmo() %{
+instruct load_fence() %{
   predicate(!UseZtso);
   match(LoadFence);
+  ins_cost(VOLATILE_REF_COST);
+
+  format %{ "#@load_fence\n\t"
+            "fence r, rw" %}
+
+  ins_encode %{
+    __ block_comment("membar_aqcuire_rvwmo");
+    __ membar(MacroAssembler::LoadLoad | MacroAssembler::LoadStore);
+  %}
+  ins_pipe(pipe_serial);
+%}
+
+instruct unnecessary_membar_aqcuire_rvwmo() %{
+  predicate(!UseZtso && unnecessary_acquire(n));
+  match(MemBarAcquire);
+  ins_cost(0);
+
+  format %{ "#@membar_aqcuire_rvwmo (elided)" %}
+
+  ins_encode %{
+    __ block_comment("membar_aqcuire_rvwmo (elided)");
+  %}
+  ins_pipe(pipe_class_empty);
+%}
+
+instruct membar_aqcuire_rvwmo() %{
+  predicate(!UseZtso);
   match(MemBarAcquire);
   ins_cost(VOLATILE_REF_COST);
 
@@ -8216,9 +8309,36 @@ instruct membar_aqcuire_rvwmo() %{
   ins_pipe(pipe_serial);
 %}
 
-instruct membar_release_rvwmo() %{
+instruct store_fence() %{
   predicate(!UseZtso);
   match(StoreFence);
+  ins_cost(VOLATILE_REF_COST);
+
+  format %{ "#@store_fence\n\t"
+            "fence rw, w" %}
+
+  ins_encode %{
+    __ block_comment("membar_release_rvwmo");
+    __ membar(MacroAssembler::LoadStore | MacroAssembler::StoreStore);
+  %}
+  ins_pipe(pipe_serial);
+%}
+
+instruct unnecessary_membar_release_rvwmo() %{
+  predicate(!UseZtso && unnecessary_release(n));
+  match(MemBarRelease);
+  ins_cost(0);
+
+  format %{ "#@membar_release_rvwmo (elided)" %}
+
+  ins_encode %{
+    __ block_comment("membar_release_rvwmo (elided)");
+  %}
+  ins_pipe(pipe_serial);
+%}
+
+instruct membar_release_rvwmo() %{
+  predicate(!UseZtso);
   match(MemBarRelease);
   ins_cost(VOLATILE_REF_COST);
 
