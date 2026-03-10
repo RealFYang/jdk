@@ -320,7 +320,7 @@ public:
     DEBUG_ONLY(_reserved = 0; )
   }
 
-  void clear_claimed() { _claimed_index = 0; }
+  void clear_claimed() { _claimed_index.store_relaxed(0); }
   T*   claim_next();
 
   // reserve queues that not for parallel claiming
