@@ -385,7 +385,48 @@ int LIR_Assembler::emit_deopt_handler() {
 void LIR_Assembler::return_op(LIR_Opr result, C1SafepointPollStub* code_stub) {
   assert(result->is_illegal() || !result->is_single_cpu() || result->as_register() == x10, "word returns are in x10");
 
-  assert(!InlineTypeReturnedAsFields, "unimplemented");
+  if (InlineTypeReturnedAsFields) {
+    // Check if we are returning a non-null inline type and load its fields into registers
+    ciType* return_type = compilation()->method()->return_type();
+    if (return_type->is_inlinetype()) {
+      ciInlineKlass* vk = return_type->as_inline_klass();
+      if (vk->can_be_returned_as_fields()) {
+        address unpack_handler = vk->unpack_handler();
+        assert(unpack_handler != nullptr, "must be");
+        // Use li+jalr instead of far_call because unpack_handler is in a
+        // BufferedInlineTypeBlob which may not pass CodeCache::contains()
+        __ li(t1, (intptr_t)unpack_handler);
+        __ jalr(t1);
+      }
+    } else if (return_type->is_instance_klass() && (!return_type->is_loaded() || StressCallingConvention)) {
+      Label skip;
+      Label not_null;
+      __ bnez(x10, not_null);
+      // Returned value is null, zero all return registers because they may belong to oop fields
+      __ mv(j_rarg1, zr);
+      __ mv(j_rarg2, zr);
+      __ mv(j_rarg3, zr);
+      __ mv(j_rarg4, zr);
+      __ mv(j_rarg5, zr);
+      __ mv(j_rarg6, zr);
+      __ mv(j_rarg7, zr);
+      __ j(skip);
+      __ bind(not_null);
+
+      // Check if we are returning a non-null inline type and load its fields into registers
+      __ test_oop_is_not_inline_type(x10, t1, skip, /* can_be_null= */ false);
+
+      // Load fields from a buffered value with an inline class specific handler
+      __ load_klass(t1 /*dst*/, x10 /*src*/);
+      __ ld(t1, Address(t1, InlineKlass::adr_members_offset()));
+      __ ld(t1, Address(t1, InlineKlass::unpack_handler_offset()));
+      // Unpack handler can be null if inline type is not scalarizable in returns
+      __ beqz(t1, skip);
+      __ jalr(t1);
+
+      __ bind(skip);
+    }
+  }
 
   // Pop the stack before the safepoint code
   __ remove_frame(initial_frame_size_in_bytes(), needs_stack_repair());
@@ -401,8 +442,7 @@ void LIR_Assembler::return_op(LIR_Opr result, C1SafepointPollStub* code_stub) {
 }
 
 int LIR_Assembler::store_inline_type_fields_to_buf(ciInlineKlass* vk) {
-  Unimplemented();
-  return 0;
+  return (__ store_inline_type_fields_to_buf(vk, false));
 }
 
 int LIR_Assembler::safepoint_poll(LIR_Opr tmp, CodeEmitInfo* info) {
@@ -1350,7 +1390,7 @@ void LIR_Assembler::emit_profile_inline_type(LIR_OpProfileInlineType* op) {
 }
 
 void LIR_Assembler::check_orig_pc() {
-  Unimplemented();
+  __ ld(t0, frame_map()->address_for_orig_pc_addr());
 }
 
 void LIR_Assembler::emit_compare_and_swap(LIR_OpCompareAndSwap* op) {

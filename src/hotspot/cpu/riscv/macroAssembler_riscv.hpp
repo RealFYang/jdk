@@ -1307,6 +1307,7 @@ public:
   // Frame creation and destruction shared between JITs.
   void build_frame(int framesize);
   void remove_frame(int framesize);
+  void save_stack_increment(int sp_inc, int frame_size);
 
   void verified_entry(Compile* C, int sp_inc);
 

@@ -705,6 +705,38 @@ void InterpreterMacroAssembler::remove_activation(TosState state,
     bind(no_reserved_zone_enabling);
   }
 
+  if (state == atos && InlineTypeReturnedAsFields) {
+    Label skip;
+    Label not_null;
+    bnez(x10, not_null);
+    // Returned null, zero all return registers that may hold oop fields
+    mv(j_rarg1, zr);
+    mv(j_rarg2, zr);
+    mv(j_rarg3, zr);
+    mv(j_rarg4, zr);
+    mv(j_rarg5, zr);
+    mv(j_rarg6, zr);
+    mv(j_rarg7, zr);
+    j(skip);
+    bind(not_null);
+
+    // Check if we are returning a non-null inline type and load its fields into registers
+    // Use t1 as tmp (not t0, which is used internally by test_oop_is_not_inline_type)
+    test_oop_is_not_inline_type(x10, t1, skip, /* can_be_null= */ false);
+
+    // Load fields from a buffered value with an inline class specific handler
+    load_klass(t1 /*dst*/, x10 /*src*/);
+    ld(t1, Address(t1, InlineKlass::adr_members_offset()));
+    ld(t1, Address(t1, InlineKlass::unpack_handler_offset()));
+    // Unpack handler can be null if inline type is not scalarizable in returns
+    beqz(t1, skip);
+
+    jalr(t1);
+    bind(skip);
+    // Check above kills sender sp in t1. Reload it.
+    ld(t1, Address(fp, frame::interpreter_frame_sender_sp_offset * wordSize));
+  }
+
   // remove frame anchor
   leave();
 

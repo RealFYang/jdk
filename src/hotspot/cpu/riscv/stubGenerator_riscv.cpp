@@ -362,20 +362,25 @@ class StubGenerator: public StubCodeGenerator {
     // T_OBJECT, T_LONG, T_FLOAT or T_DOUBLE is treated as T_INT)
     // n.b. this assumes Java returns an integral result in x10
     // and a floating result in j_farg0
-    __ ld(j_rarg2, result);
-    Label is_long, is_float, is_double, exit;
-    __ ld(j_rarg1, result_type);
+    // All of j_rargN may be used to return inline type fields so be careful
+    // not to clobber those.
+    // SharedRuntime::generate_buffered_inline_type_adapter() knows the register
+    // assignment of Rresult below.
+    Register Rresult = t3, Rresult_type = t2;
+    __ ld(Rresult, result);
+    Label is_long, is_float, is_double, check_prim, exit;
+    __ ld(Rresult_type, result_type);
     __ mv(t0, (u1)T_OBJECT);
-    __ beq(j_rarg1, t0, is_long);
+    __ beq(Rresult_type, t0, check_prim);
     __ mv(t0, (u1)T_LONG);
-    __ beq(j_rarg1, t0, is_long);
+    __ beq(Rresult_type, t0, is_long);
     __ mv(t0, (u1)T_FLOAT);
-    __ beq(j_rarg1, t0, is_float);
+    __ beq(Rresult_type, t0, is_float);
     __ mv(t0, (u1)T_DOUBLE);
-    __ beq(j_rarg1, t0, is_double);
+    __ beq(Rresult_type, t0, is_double);
 
     // handle T_INT case
-    __ sw(x10, Address(j_rarg2));
+    __ sw(x10, Address(Rresult));
 
     __ BIND(exit);
 
@@ -448,16 +453,33 @@ class StubGenerator: public StubCodeGenerator {
 
     // handle return types different from T_INT
 
+    __ BIND(check_prim);
+    if (InlineTypeReturnedAsFields) {
+      // Check for scalarized return value: if bit 0 of x10 is 0, it's a regular oop
+      __ test_bit(t2, x10, 0);
+      __ beqz(t2, is_long);
+      // x10 has bit 0 set → it's a klass pointer, not an oop.
+      // Call the pack handler to buffer the scalarized fields into the
+      // pre-allocated buffer whose JNI handle sits at *Rresult
+      // (allocated by JavaCalls::call_helper).
+      __ andi(t1, x10, -2);  // clear bit 0 to get the InlineKlass*
+      __ ld(t1, Address(t1, InlineKlass::adr_members_offset()));
+      __ ld(t1, Address(t1, InlineKlass::pack_handler_jobject_offset()));
+      __ jalr(t1);
+      // pack_handler_jobject stores the result to *Rresult (t3)
+      __ j(exit);
+    }
+
     __ BIND(is_long);
-    __ sd(x10, Address(j_rarg2, 0));
+    __ sd(x10, Address(Rresult, 0));
     __ j(exit);
 
     __ BIND(is_float);
-    __ fsw(j_farg0, Address(j_rarg2, 0), t0);
+    __ fsw(j_farg0, Address(Rresult, 0), t0);
     __ j(exit);
 
     __ BIND(is_double);
-    __ fsd(j_farg0, Address(j_rarg2, 0), t0);
+    __ fsd(j_farg0, Address(Rresult, 0), t0);
     __ j(exit);
 
     return start;
@@ -4710,6 +4732,48 @@ class StubGenerator: public StubCodeGenerator {
 
 #endif // COMPILER2
 
+  // Save/restore all return registers for continuation return barrier.
+  // When InlineTypeReturnedAsFields is true, inline types are returned
+  // scattered across x10-x17/f10-f17. The return barrier must preserve
+  // all of them across the thaw call.
+  static void save_return_registers(MacroAssembler* masm) {
+    if (InlineTypeReturnedAsFields) {
+      masm->push_reg(RegSet::range(x10, x17), sp);
+      masm->subi(sp, sp, 8 * wordSize);
+      masm->fsd(f10, Address(sp, 0 * wordSize));
+      masm->fsd(f11, Address(sp, 1 * wordSize));
+      masm->fsd(f12, Address(sp, 2 * wordSize));
+      masm->fsd(f13, Address(sp, 3 * wordSize));
+      masm->fsd(f14, Address(sp, 4 * wordSize));
+      masm->fsd(f15, Address(sp, 5 * wordSize));
+      masm->fsd(f16, Address(sp, 6 * wordSize));
+      masm->fsd(f17, Address(sp, 7 * wordSize));
+    } else {
+      masm->subi(sp, sp, 2 * wordSize);
+      masm->fsd(f10, Address(sp, 0 * wordSize));
+      masm->sd(x10, Address(sp, 1 * wordSize));
+    }
+  }
+
+  static void restore_return_registers(MacroAssembler* masm) {
+    if (InlineTypeReturnedAsFields) {
+      masm->fld(f17, Address(sp, 7 * wordSize));
+      masm->fld(f16, Address(sp, 6 * wordSize));
+      masm->fld(f15, Address(sp, 5 * wordSize));
+      masm->fld(f14, Address(sp, 4 * wordSize));
+      masm->fld(f13, Address(sp, 3 * wordSize));
+      masm->fld(f12, Address(sp, 2 * wordSize));
+      masm->fld(f11, Address(sp, 1 * wordSize));
+      masm->fld(f10, Address(sp, 0 * wordSize));
+      masm->addi(sp, sp, 8 * wordSize);
+      masm->pop_reg(RegSet::range(x10, x17), sp);
+    } else {
+      masm->ld(x10, Address(sp, 1 * wordSize));
+      masm->fld(f10, Address(sp, 0 * wordSize));
+      masm->addi(sp, sp, 2 * wordSize);
+    }
+  }
+
   address generate_cont_thaw(Continuation::thaw_kind kind) {
     bool return_barrier = Continuation::is_thaw_return_barrier(kind);
     bool return_barrier_exception = Continuation::is_thaw_return_barrier_exception(kind);
@@ -4732,9 +4796,7 @@ class StubGenerator: public StubCodeGenerator {
 
     if (return_barrier) {
       // preserve possible return value from a method returning to the return barrier
-      __ subi(sp, sp, 2 * wordSize);
-      __ fsd(f10, Address(sp, 0 * wordSize));
-      __ sd(x10, Address(sp, 1 * wordSize));
+      save_return_registers(_masm);
     }
 
     __ mv(c_rarg1, (return_barrier ? 1 : 0));
@@ -4743,9 +4805,7 @@ class StubGenerator: public StubCodeGenerator {
 
     if (return_barrier) {
       // restore return value (no safepoint in the call to thaw, so even an oop return value should be OK)
-      __ ld(x10, Address(sp, 1 * wordSize));
-      __ fld(f10, Address(sp, 0 * wordSize));
-      __ addi(sp, sp, 2 * wordSize);
+      restore_return_registers(_masm);
     }
 
 #ifndef PRODUCT
@@ -4770,9 +4830,7 @@ class StubGenerator: public StubCodeGenerator {
 
     if (return_barrier) {
       // save original return value -- again
-      __ subi(sp, sp, 2 * wordSize);
-      __ fsd(f10, Address(sp, 0 * wordSize));
-      __ sd(x10, Address(sp, 1 * wordSize));
+      save_return_registers(_masm);
     }
 
     // If we want, we can templatize thaw by kind, and have three different entries
@@ -4783,9 +4841,7 @@ class StubGenerator: public StubCodeGenerator {
 
     if (return_barrier) {
       // restore return value (no safepoint in the call to thaw, so even an oop return value should be OK)
-      __ ld(x10, Address(sp, 1 * wordSize));
-      __ fld(f10, Address(sp, 0 * wordSize));
-      __ addi(sp, sp, 2 * wordSize);
+      restore_return_registers(_masm);
     } else {
       __ mv(x10, zr); // return 0 (success) from doYield
     }

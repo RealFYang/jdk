@@ -60,18 +60,23 @@ inline frame FreezeBase::sender(const frame& f) {
     return frame(f.sender_sp(), f.interpreter_frame_sender_sp(), f.link(), f.sender_pc());
   }
 
-  intptr_t** link_addr = link_address<FKind>(f);
-  intptr_t* sender_sp = (intptr_t*)(link_addr + 2); //  f.unextended_sp() + (fsize/wordSize); //
-  address sender_pc = (address) *(sender_sp - 1);
+  // The saved FP/RA sit at sender_sp - 2/-1. For a frame that was augmented on
+  // entry (needs_stack_repair, scalarized inline type args), the real sender_sp
+  // is sp_inc words above unextended_sp + frame_size; repair_sender_sp() adds
+  // that (and is a no-op otherwise). Mirrors aarch64's compiled_frame_details().
+  intptr_t* sender_sp = f.unextended_sp() + f.cb()->frame_size();
+  sender_sp = f.repair_sender_sp(sender_sp, (intptr_t**)(sender_sp - 2));
+  intptr_t** saved_fp_addr = (intptr_t**)(sender_sp - 2);
+  address sender_pc = (address) *((intptr_t*)sender_sp - 1);
   assert(sender_sp != f.sp(), "must have changed");
 
   int slot = 0;
   CodeBlob* sender_cb = CodeCache::find_blob_and_oopmap(sender_pc, slot);
   return sender_cb != nullptr
-    ? frame(sender_sp, sender_sp, *link_addr, sender_pc, sender_cb,
+    ? frame(sender_sp, sender_sp, *saved_fp_addr, sender_pc, sender_cb,
             slot == -1 ? nullptr : sender_cb->oop_map_for_slot(slot, sender_pc),
             false /* on_heap ? */)
-    : frame(sender_sp, sender_sp, *link_addr, sender_pc);
+    : frame(sender_sp, sender_sp, *saved_fp_addr, sender_pc);
 }
 
 template<typename FKind>

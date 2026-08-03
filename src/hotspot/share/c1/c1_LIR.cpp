@@ -1268,6 +1268,10 @@ void LIR_List::set_cmp_oprs(LIR_Op* op) {
       _cmp_opr1 = op->as_OpCompareAndSwap()->result_opr();
       _cmp_opr2 = LIR_OprFact::intConst(0);
       break;
+    case lir_check_orig_pc:
+      _cmp_opr1 = FrameMap::as_opr(t0);
+      _cmp_opr2 = LIR_OprFact::intConst(0);
+      break;
 #if INCLUDE_ZGC
     case lir_xloadbarrier_test:
       _cmp_opr1 = FrameMap::as_opr(t1);

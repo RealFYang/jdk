@@ -390,8 +390,147 @@ int SharedRuntime::java_return_convention(const BasicType *sig_bt,
 }
 
 BufferedInlineTypeBlob* SharedRuntime::generate_buffered_inline_type_adapter(const InlineKlass* vk) {
-  Unimplemented();
-  return nullptr;
+  BufferBlob* buf = BufferBlob::create("inline types pack/unpack", 16 * K);
+  if (buf == nullptr) {
+    return nullptr;
+  }
+  CodeBuffer buffer(buf);
+  short buffer_locs[20];
+  buffer.insts()->initialize_shared_locs((relocInfo*)buffer_locs,
+                                         sizeof(buffer_locs)/sizeof(relocInfo));
+
+  MacroAssembler _masm(&buffer);
+  MacroAssembler* masm = &_masm;
+
+  const Array<SigEntry>* sig_vk = vk->extended_sig();
+  const Array<VMRegPair>* regs = vk->return_regs();
+
+  int pack_fields_jobject_off = __ offset();
+  // Resolve pre-allocated buffer from JNI handle.
+  // We cannot do this in generate_call_stub() because it requires GC code to be initialized.
+  Register Rresult = t3;  // See StubGenerator::generate_call_stub().
+  __ ld(x10, Address(Rresult));
+  __ resolve_jobject(x10, t0, t1);
+  __ sd(x10, Address(Rresult));
+
+  int pack_fields_off = __ offset();
+
+  int j = 1;
+  for (int i = 0; i < sig_vk->length(); i++) {
+    BasicType bt = sig_vk->at(i)._bt;
+    if (bt == T_METADATA) {
+      continue;
+    }
+    if (bt == T_VOID) {
+      if (sig_vk->at(i-1)._bt == T_LONG ||
+          sig_vk->at(i-1)._bt == T_DOUBLE) {
+        j++;
+      }
+      continue;
+    }
+    int off = sig_vk->at(i)._offset;
+    VMRegPair pair = regs->at(j);
+    VMReg r_1 = pair.first();
+    VMReg r_2 = pair.second();
+    Address to(x10, off);
+    if (bt == T_FLOAT) {
+      __ fsw(r_1->as_FloatRegister(), to);
+    } else if (bt == T_DOUBLE) {
+      __ fsd(r_1->as_FloatRegister(), to);
+    } else {
+      Register val = r_1->as_Register();
+      assert_different_registers(x10, val, t0, t5, t2);
+      if (is_reference_type(bt)) {
+        __ mv(t2, x10);
+        Address to_with_t2(t2, off);
+        __ store_heap_oop(to_with_t2, val, t0, t5, t2, IN_HEAP | ACCESS_WRITE | IS_DEST_UNINITIALIZED);
+      } else {
+        __ store_sized_value(to, r_1->as_Register(), type2aelembytes(bt));
+      }
+    }
+    j++;
+  }
+  assert(j == regs->length(), "missed a field?");
+  if (vk->supports_nullable_layouts()) {
+    __ sb(zr, Address(x10, vk->null_marker_offset()));
+  }
+  __ ret();
+
+  int unpack_fields_off = __ offset();
+
+  Label skip;
+  Label not_null;
+  __ bnez(x10, not_null);
+
+  j = 1;
+  for (int i = 0; i < sig_vk->length(); i++) {
+    BasicType bt = sig_vk->at(i)._bt;
+    if (bt == T_METADATA) {
+      continue;
+    }
+    if (bt == T_VOID) {
+      if (sig_vk->at(i-1)._bt == T_LONG ||
+          sig_vk->at(i-1)._bt == T_DOUBLE) {
+        j++;
+      }
+      continue;
+    }
+
+    VMRegPair pair = regs->at(j);
+    VMReg r_1 = pair.first();
+    if (r_1->is_FloatRegister()) {
+      __ fmv_d_x(r_1->as_FloatRegister(), zr);
+    } else {
+      __ mv(r_1->as_Register(), zr);
+    }
+    j++;
+  }
+  __ j(skip);
+  __ bind(not_null);
+
+  j = 1;
+  for (int i = 0; i < sig_vk->length(); i++) {
+    BasicType bt = sig_vk->at(i)._bt;
+    if (bt == T_METADATA) {
+      continue;
+    }
+    if (bt == T_VOID) {
+      if (sig_vk->at(i-1)._bt == T_LONG ||
+          sig_vk->at(i-1)._bt == T_DOUBLE) {
+        j++;
+      }
+      continue;
+    }
+    int off = sig_vk->at(i)._offset;
+    assert(off > 0, "offset in object should be positive");
+    VMRegPair pair = regs->at(j);
+    VMReg r_1 = pair.first();
+    VMReg r_2 = pair.second();
+    Address from(x10, off);
+    if (bt == T_FLOAT) {
+      __ flw(r_1->as_FloatRegister(), from);
+    } else if (bt == T_DOUBLE) {
+      __ fld(r_1->as_FloatRegister(), from);
+    } else if (bt == T_OBJECT || bt == T_ARRAY) {
+      assert_different_registers(x10, r_1->as_Register());
+      __ load_heap_oop(r_1->as_Register(), from, t0, t1);
+    } else {
+      assert(is_java_primitive(bt), "unexpected basic type");
+      assert_different_registers(x10, r_1->as_Register());
+      size_t size_in_bytes = type2aelembytes(bt);
+      __ load_sized_value(r_1->as_Register(), from, size_in_bytes, bt != T_CHAR && bt != T_BOOLEAN);
+    }
+    j++;
+  }
+  assert(j == regs->length(), "missed a field?");
+
+  __ bind(skip);
+
+  __ ret();
+
+  __ flush();
+
+  return BufferedInlineTypeBlob::create(&buffer, pack_fields_off, pack_fields_jobject_off, unpack_fields_off);
 }
 
 // Patch the callers callsite with entry to compiled code if it exists.
@@ -428,8 +567,31 @@ static void patch_callers_callsite(MacroAssembler *masm) {
 // calling convention the interpreter expects).
 static int compute_total_args_passed_int(const GrowableArray<SigEntry>* sig_extended) {
   int total_args_passed = 0;
-  assert(!InlineTypePassFieldsAsArgs, "");
-  total_args_passed = sig_extended->length();
+  if (InlineTypePassFieldsAsArgs) {
+    for (int i = 0; i < sig_extended->length(); i++) {
+      BasicType bt = sig_extended->at(i)._bt;
+      if (bt == T_METADATA) {
+        total_args_passed++;
+        int vt = 1;
+        do {
+          i++;
+          BasicType bt = sig_extended->at(i)._bt;
+          BasicType prev_bt = sig_extended->at(i-1)._bt;
+          if (bt == T_METADATA) {
+            vt++;
+          } else if (bt == T_VOID &&
+                     prev_bt != T_LONG &&
+                     prev_bt != T_DOUBLE) {
+            vt--;
+          }
+        } while (vt != 0);
+      } else {
+        total_args_passed++;
+      }
+    }
+  } else {
+    total_args_passed = sig_extended->length();
+  }
   return total_args_passed;
 }
 
@@ -439,24 +601,15 @@ static void gen_c2i_adapter_helper(MacroAssembler* masm,
                                    size_t size_in_bytes,
                                    const VMRegPair& reg_pair,
                                    const Address& to,
-                                   int extraspace) {
+                                   Register tmp1,
+                                   Register tmp2,
+                                   Register tmp3,
+                                   int extraspace,
+                                   bool is_oop) {
   if (bt == T_VOID) {
     assert(prev_bt == T_LONG || prev_bt == T_DOUBLE, "missing half");
     return;
   }
-
-  // Say 4 args:
-  // i   st_off
-  // 0   32 T_LONG
-  // 1   24 T_VOID
-  // 2   16 T_OBJECT
-  // 3    8 T_BOOL
-  // -    0 return address
-  //
-  // However to make thing extra confusing. Because we can fit a Java long/double in
-  // a single slot on a 64 bit vm and it would be silly to break them up, the interpreter
-  // leaves one slot empty and only stores to a single slot. In this case the
-  // slot that is occupied is the T_VOID slot. See I said it was confusing.
 
   bool wide = (size_in_bytes == wordSize);
 
@@ -476,7 +629,18 @@ static void gen_c2i_adapter_helper(MacroAssembler* masm,
     } else {
       val = r_1->as_Register();
     }
-    __ store_sized_value(to, val, size_in_bytes);
+    if (is_oop) {
+      // Save to.base() on the real stack (sp), not via push_reg which uses esp (x20).
+      // In the c2i adapter, x20 is repurposed as buf_array, so push_reg would
+      // corrupt heap memory instead of pushing to the stack.
+      __ addi(sp, sp, -wordSize);
+      __ sd(to.base(), Address(sp, 0));
+      __ store_heap_oop(to, val, tmp1, tmp2, tmp3, IN_HEAP | ACCESS_WRITE | IS_DEST_UNINITIALIZED);
+      __ ld(to.base(), Address(sp, 0));
+      __ addi(sp, sp, wordSize);
+    } else {
+      __ store_sized_value(to, val, size_in_bytes);
+    }
   } else {
     if (wide) {
       __ fsd(r_1->as_FloatRegister(), to);
@@ -528,6 +692,61 @@ static void gen_c2i_adapter(MacroAssembler *masm,
 
   __ bind(skip_fixup);
 
+  // Name some registers to be used in the following code. We can use
+  // anything except x10-x17 which are arguments in the Java calling
+  // convention, xmethod (x31), and x19 which holds the outgoing sender SP.
+  // buf_array and buf_oop must be distinct from tmp1/tmp2/tmp3 since the
+  // G1 post-barrier clobbers tmp1/tmp2 and buf_array must survive across
+  // multiple inline type argument groups.
+  Register buf_array = x20;  // s4 - not a Java arg reg, survives G1 barriers
+  Register buf_oop = x21;    // s5 - not a Java arg reg, survives G1 barriers
+  Register tmp1 = t3;
+  Register tmp2 = t4;
+  Register tmp3 = t5;
+
+  if (InlineTypePassFieldsAsArgs) {
+    // Is there an inline type argument?
+    bool has_inline_argument = false;
+    for (int i = 0; i < sig_extended->length() && !has_inline_argument; i++) {
+      has_inline_argument = (sig_extended->at(i)._bt == T_METADATA);
+    }
+    if (has_inline_argument) {
+      RegisterSaver reg_save(true /* save_vectors */);
+      OopMap* map = reg_save.save_live_registers(masm, 0, &frame_size_in_words);
+
+      frame_complete = __ offset();
+      address the_pc = __ pc();
+
+      Label retaddr;
+      __ set_last_Java_frame(sp, noreg, retaddr, t0);
+
+      __ mv(c_rarg0, xthread);
+      __ mv(c_rarg1, xmethod);
+      __ mv(c_rarg2, (int64_t)alloc_inline_receiver);
+
+      __ rt_call(CAST_FROM_FN_PTR(address, SharedRuntime::allocate_inline_types));
+      __ bind(retaddr);
+
+      oop_maps->add_gc_map(__ pc() - start, map);
+      __ reset_last_Java_frame(false);
+
+      reg_save.restore_live_registers(masm);
+
+      Label no_exception;
+      __ ld(t0, Address(xthread, Thread::pending_exception_offset()));
+      __ beqz(t0, no_exception);
+
+      __ sd(zr, Address(xthread, JavaThread::vm_result_oop_offset()));
+      __ ld(x10, Address(xthread, Thread::pending_exception_offset()));
+      __ far_jump(RuntimeAddress(StubRoutines::forward_exception_entry()));
+
+      __ bind(no_exception);
+
+      // We get an array of objects from the runtime call
+      __ get_vm_result_oop(buf_array, xthread);
+    }
+  }
+
   // Since all args are passed on the stack, total_args_passed *
   // Interpreter::stackElementSize is the space we need.
 
@@ -544,40 +763,86 @@ static void gen_c2i_adapter(MacroAssembler *masm,
   }
 
   // Now write the args into the outgoing interpreter space
-
-  // next_arg_comp is the next argument from the compiler point of
-  // view (inline type fields are passed in registers/on the stack). In
-  // sig_extended, an inline type argument starts with: T_METADATA,
-  // followed by the types of the fields of the inline type and T_VOID
-  // to mark the end of the inline type. ignored counts the number of
-  // T_METADATA/T_VOID. next_vt_arg is the next inline type argument:
-  // used to get the buffer for that argument from the pool of buffers
-  // we allocated above and want to pass to the
-  // interpreter. next_arg_int is the next argument from the
-  // interpreter point of view (inline types are passed by reference).
   for (int next_arg_comp = 0, ignored = 0, next_vt_arg = 0, next_arg_int = 0;
        next_arg_comp < sig_extended->length(); next_arg_comp++) {
     assert(ignored <= next_arg_comp, "shouldn't skip over more slots than there are arguments");
     assert(next_arg_int <= total_args_passed, "more arguments for the interpreter than expected?");
     BasicType bt = sig_extended->at(next_arg_comp)._bt;
-    assert(!InlineTypePassFieldsAsArgs, "");
-
     int st_off = (total_args_passed - next_arg_int - 1) * Interpreter::stackElementSize;
-    int next_off = st_off - Interpreter::stackElementSize;
-    const int offset = (bt == T_LONG || bt == T_DOUBLE) ? next_off : st_off;
-    const VMRegPair reg_pair = regs[next_arg_comp-ignored];
-    size_t size_in_bytes = reg_pair.second()->is_valid() ? 8 : 4;
-    gen_c2i_adapter_helper(masm, bt, next_arg_comp > 0 ? sig_extended->at(next_arg_comp - 1)._bt : T_ILLEGAL,
-                           size_in_bytes, reg_pair, Address(sp, offset), extraspace);
-    next_arg_int++;
-
+    if (!InlineTypePassFieldsAsArgs || bt != T_METADATA) {
+      int next_off = st_off - Interpreter::stackElementSize;
+      const int offset = (bt == T_LONG || bt == T_DOUBLE) ? next_off : st_off;
+      const VMRegPair reg_pair = regs[next_arg_comp-ignored];
+      size_t size_in_bytes = reg_pair.second()->is_valid() ? 8 : 4;
+      gen_c2i_adapter_helper(masm, bt, next_arg_comp > 0 ? sig_extended->at(next_arg_comp - 1)._bt : T_ILLEGAL,
+                             size_in_bytes, reg_pair, Address(sp, offset), tmp1, tmp2, tmp3, extraspace, false);
+      next_arg_int++;
 #ifdef ASSERT
-    if (bt == T_LONG || bt == T_DOUBLE) {
-      // Overwrite the unused slot with known junk
-      __ mv(t0, CONST64(0xdeadffffdeadaaaa));
-      __ sd(t0, Address(sp, st_off));
-    }
+      if (bt == T_LONG || bt == T_DOUBLE) {
+        // Overwrite the unused slot with known junk
+        __ mv(t0, CONST64(0xdeadffffdeadaaaa));
+        __ sd(t0, Address(sp, st_off));
+      }
 #endif /* ASSERT */
+    } else {
+      ignored++;
+      next_arg_int++;
+      int vt = 1;
+      Label L_null;
+      Label not_null_buffer;
+      do {
+        next_arg_comp++;
+        BasicType bt = sig_extended->at(next_arg_comp)._bt;
+        BasicType prev_bt = sig_extended->at(next_arg_comp - 1)._bt;
+        if (bt == T_METADATA) {
+          vt++;
+          ignored++;
+        } else if (bt == T_VOID && prev_bt != T_LONG && prev_bt != T_DOUBLE) {
+          vt--;
+          ignored++;
+        } else if (sig_extended->at(next_arg_comp)._vt_oop) {
+          VMReg buffer = regs[next_arg_comp-ignored].first();
+          if (buffer->is_stack()) {
+            int ld_off = buffer->reg2stack() * VMRegImpl::stack_slot_size + extraspace;
+            __ ld(buf_oop, Address(sp, ld_off));
+          } else {
+            __ mv(buf_oop, buffer->as_Register());
+          }
+          __ bnez(buf_oop, not_null_buffer);
+          // get the buffer from the just allocated pool of buffers
+          int index = arrayOopDesc::base_offset_in_bytes(T_OBJECT) + next_vt_arg * type2aelembytes(T_OBJECT);
+          __ load_heap_oop(buf_oop, Address(buf_array, index), t0, tmp2);
+          next_vt_arg++;
+        } else {
+          int off = sig_extended->at(next_arg_comp)._offset;
+          if (off == -1) {
+            // Nullable inline type argument, emit null check
+            VMReg reg = regs[next_arg_comp-ignored].first();
+            Label L_notNull;
+            if (reg->is_stack()) {
+              int ld_off = reg->reg2stack() * VMRegImpl::stack_slot_size + extraspace;
+              __ lbu(tmp1, Address(sp, ld_off));
+              __ bnez(tmp1, L_notNull);
+            } else {
+              __ bnez(reg->as_Register(), L_notNull);
+            }
+            __ sd(zr, Address(sp, st_off));
+            __ j(L_null);
+            __ bind(L_notNull);
+            continue;
+          }
+          assert(off > 0, "offset in object should be positive");
+          size_t size_in_bytes = is_java_primitive(bt) ? type2aelembytes(bt) : wordSize;
+          bool is_oop = is_reference_type(bt);
+          gen_c2i_adapter_helper(masm, bt, next_arg_comp > 0 ? sig_extended->at(next_arg_comp-1)._bt : T_ILLEGAL,
+                                 size_in_bytes, regs[next_arg_comp-ignored], Address(buf_oop, off), tmp1, tmp2, tmp3, extraspace, is_oop);
+        }
+      } while (vt != 0);
+      // pass the buffer to the interpreter
+      __ bind(not_null_buffer);
+      __ sd(buf_oop, Address(sp, st_off));
+      __ bind(L_null);
+    }
   }
 
   __ mv(esp, sp); // Interp expects args on caller's expression stack
@@ -2762,8 +3027,150 @@ RuntimeStub* SharedRuntime::generate_throw_exception(StubId id, address runtime_
 // Call here from the interpreter or compiled code to store returned
 // values to a newly allocated inline type instance.
 RuntimeStub* SharedRuntime::generate_return_value_stub(address destination) {
-  Unimplemented();
-  return nullptr;
+  StubId id = StubId::shared_store_inline_type_fields_to_buf_id;
+
+  const char* name = SharedRuntime::stub_name(id);
+
+  enum layout {
+    j_rarg7_off = 0,  // x10
+    j_rarg0_off,      // x11
+    j_rarg1_off,      // x12
+    j_rarg2_off,      // x13
+    j_rarg3_off,      // x14
+    j_rarg4_off,      // x15
+    j_rarg5_off,      // x16
+    j_rarg6_off,      // x17
+
+    j_farg0_off,      // f10
+    j_farg1_off,      // f11
+    j_farg2_off,      // f12
+    j_farg3_off,      // f13
+    j_farg4_off,      // f14
+    j_farg5_off,      // f15
+    j_farg6_off,      // f16
+    j_farg7_off,      // f17
+
+    fp_off,
+    return_off,
+
+    framesize
+  };
+
+  int frame_size_in_bytes = align_up(framesize * (int)wordSize, 16);
+  int frame_size_in_words = frame_size_in_bytes / wordSize;
+
+  ResourceMark rm;
+  CodeBuffer code(name, 512, 64);
+  MacroAssembler* masm = new MacroAssembler(&code);
+
+  OopMapSet* oop_maps = new OopMapSet();
+  OopMap* map = new OopMap(frame_size_in_bytes / VMRegImpl::stack_slot_size, 0);
+
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg7_off * VMRegImpl::slots_per_word), j_rarg7->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg0_off * VMRegImpl::slots_per_word), j_rarg0->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg1_off * VMRegImpl::slots_per_word), j_rarg1->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg2_off * VMRegImpl::slots_per_word), j_rarg2->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg3_off * VMRegImpl::slots_per_word), j_rarg3->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg4_off * VMRegImpl::slots_per_word), j_rarg4->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg5_off * VMRegImpl::slots_per_word), j_rarg5->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_rarg6_off * VMRegImpl::slots_per_word), j_rarg6->as_VMReg());
+
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg0_off * VMRegImpl::slots_per_word), j_farg0->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg1_off * VMRegImpl::slots_per_word), j_farg1->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg2_off * VMRegImpl::slots_per_word), j_farg2->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg3_off * VMRegImpl::slots_per_word), j_farg3->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg4_off * VMRegImpl::slots_per_word), j_farg4->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg5_off * VMRegImpl::slots_per_word), j_farg5->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg6_off * VMRegImpl::slots_per_word), j_farg6->as_VMReg());
+  map->set_callee_saved(VMRegImpl::stack2reg(j_farg7_off * VMRegImpl::slots_per_word), j_farg7->as_VMReg());
+
+  address start = __ pc();
+
+  __ addi(sp, sp, -frame_size_in_bytes);
+  __ sd(fp, Address(sp, fp_off * wordSize));
+  __ sd(ra, Address(sp, return_off * wordSize));
+  __ addi(fp, sp, frame_size_in_bytes);
+
+  __ sd(j_rarg7, Address(sp, j_rarg7_off * wordSize));
+  __ sd(j_rarg0, Address(sp, j_rarg0_off * wordSize));
+  __ sd(j_rarg1, Address(sp, j_rarg1_off * wordSize));
+  __ sd(j_rarg2, Address(sp, j_rarg2_off * wordSize));
+  __ sd(j_rarg3, Address(sp, j_rarg3_off * wordSize));
+  __ sd(j_rarg4, Address(sp, j_rarg4_off * wordSize));
+  __ sd(j_rarg5, Address(sp, j_rarg5_off * wordSize));
+  __ sd(j_rarg6, Address(sp, j_rarg6_off * wordSize));
+
+  __ fsd(j_farg0, Address(sp, j_farg0_off * wordSize));
+  __ fsd(j_farg1, Address(sp, j_farg1_off * wordSize));
+  __ fsd(j_farg2, Address(sp, j_farg2_off * wordSize));
+  __ fsd(j_farg3, Address(sp, j_farg3_off * wordSize));
+  __ fsd(j_farg4, Address(sp, j_farg4_off * wordSize));
+  __ fsd(j_farg5, Address(sp, j_farg5_off * wordSize));
+  __ fsd(j_farg6, Address(sp, j_farg6_off * wordSize));
+  __ fsd(j_farg7, Address(sp, j_farg7_off * wordSize));
+
+  int frame_complete = __ offset();
+
+  address the_pc = __ pc();
+  __ set_last_Java_frame(sp, noreg, the_pc, t0);
+
+  __ mv(c_rarg1, x10);
+  __ mv(c_rarg0, xthread);
+
+  __ la(t1, ExternalAddress(destination));
+  __ jalr(t1);
+
+  oop_maps->add_gc_map(the_pc - start, map);
+
+  __ reset_last_Java_frame(false);
+
+  __ ld(j_rarg6, Address(sp, j_rarg6_off * wordSize));
+  __ ld(j_rarg5, Address(sp, j_rarg5_off * wordSize));
+  __ ld(j_rarg4, Address(sp, j_rarg4_off * wordSize));
+  __ ld(j_rarg3, Address(sp, j_rarg3_off * wordSize));
+  __ ld(j_rarg2, Address(sp, j_rarg2_off * wordSize));
+  __ ld(j_rarg1, Address(sp, j_rarg1_off * wordSize));
+  __ ld(j_rarg0, Address(sp, j_rarg0_off * wordSize));
+  __ ld(j_rarg7, Address(sp, j_rarg7_off * wordSize));
+
+  __ fld(j_farg7, Address(sp, j_farg7_off * wordSize));
+  __ fld(j_farg6, Address(sp, j_farg6_off * wordSize));
+  __ fld(j_farg5, Address(sp, j_farg5_off * wordSize));
+  __ fld(j_farg4, Address(sp, j_farg4_off * wordSize));
+  __ fld(j_farg3, Address(sp, j_farg3_off * wordSize));
+  __ fld(j_farg2, Address(sp, j_farg2_off * wordSize));
+  __ fld(j_farg1, Address(sp, j_farg1_off * wordSize));
+  __ fld(j_farg0, Address(sp, j_farg0_off * wordSize));
+
+  Label pending;
+  __ ld(t1, Address(xthread, in_bytes(Thread::pending_exception_offset())));
+  __ bnez(t1, pending);
+
+  Label skip_pack;
+  __ get_vm_result_oop(x10, xthread);
+  __ get_vm_result_metadata(t1, xthread);
+  __ beqz(t1, skip_pack);
+  __ ld(t1, Address(t1, InlineKlass::adr_members_offset()));
+  __ ld(t1, Address(t1, InlineKlass::pack_handler_offset()));
+  __ jalr(t1);
+  __ membar(MacroAssembler::StoreStore);
+  __ bind(skip_pack);
+
+  __ ld(fp, Address(sp, fp_off * wordSize));
+  __ ld(ra, Address(sp, return_off * wordSize));
+  __ addi(sp, sp, frame_size_in_bytes);
+  __ ret();
+
+  __ bind(pending);
+  __ ld(fp, Address(sp, fp_off * wordSize));
+  __ ld(ra, Address(sp, return_off * wordSize));
+  __ addi(sp, sp, frame_size_in_bytes);
+  __ far_jump(RuntimeAddress(StubRoutines::forward_exception_entry()));
+
+  masm->flush();
+
+  RuntimeStub* stub = RuntimeStub::new_runtime_stub(name, &code, frame_complete, frame_size_in_words, oop_maps, false);
+  return stub;
 }
 
 #if INCLUDE_JFR

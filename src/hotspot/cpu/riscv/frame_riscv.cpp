@@ -151,9 +151,13 @@ bool frame::safe_for_sender(JavaThread *thread) {
         return false;
       }
 
+      intptr_t** saved_fp_addr = (intptr_t**) (sender_sp + frame::link_offset);
+      saved_fp = *saved_fp_addr;
+      sender_pc = (address) *(sender_sp + frame::return_addr_offset);
+
+      // Repair the sender_sp if this method has scalarized inline type args
+      sender_sp = repair_sender_sp(sender_sp, saved_fp_addr);
       sender_unextended_sp = sender_sp;
-      sender_pc = (address) *(sender_sp - 1);
-      saved_fp = (intptr_t*) *(sender_sp - 2);
     }
 
     if (Continuation::is_return_barrier_entry(sender_pc)) {
@@ -623,14 +627,40 @@ frame::frame(void* ptr_sp, void* ptr_fp, void* pc) : _on_heap(false) {
 // Check for a method with scalarized inline type arguments that needs
 // a stack repair and return the repaired sender stack pointer.
 
+intptr_t* frame::repair_sender_sp(intptr_t* sender_sp, intptr_t** saved_fp_addr) const {
+  nmethod* nm = _cb->as_nmethod_or_null();
+  if (nm != nullptr && nm->needs_stack_repair()) {
+    intptr_t* sp_inc_addr = (intptr_t*) (saved_fp_addr - 1);
+    assert(*sp_inc_addr % StackAlignmentInBytes == 0, "sp_inc not aligned");
+    int real_frame_size = (*sp_inc_addr / wordSize) + metadata_words_at_bottom;
+    assert(real_frame_size >= _cb->frame_size() && real_frame_size <= 1000000, "invalid frame size");
+    sender_sp = unextended_sp() + real_frame_size;
+  }
+  return sender_sp;
+}
+
 intptr_t* frame::repair_sender_sp(nmethod* nm, intptr_t* sp, intptr_t** saved_fp_addr) {
-  Unimplemented();
-  return nullptr;
+  assert(nm != nullptr && nm->needs_stack_repair(), "");
+  // RISC-V saved-FP/RA sit at sender_sp - 2/-1 and sp_inc at sender_sp - 3
+  // (frame_riscv.hpp: metadata_words_at_bottom = 2, sender_sp_offset = 0).
+  // The shared StackChunkFrameStream::next() passes saved_fp_addr = _sp - sender_sp_offset
+  // = _sp (the sender_sp slot), not the saved-FP slot as on aarch64 (sender_sp_offset = 2),
+  // so saved_fp_addr - 1 would read the RA slot. Locate sp_inc relative to sp + frame_size
+  // instead, mirroring was_augmented_on_entry() above.
+  (void) saved_fp_addr;
+  intptr_t* real_frame_size_addr = sp + nm->frame_size() - metadata_words_at_bottom - 1;
+  int real_frame_size = (*real_frame_size_addr / wordSize) + metadata_words_at_bottom;
+  assert(real_frame_size >= nm->frame_size() && real_frame_size <= 1000000, "invalid frame size");
+  return sp + real_frame_size;
 }
 
 bool frame::was_augmented_on_entry(int& real_size) const {
   assert(is_compiled_frame(), "");
-  assert(!_cb->as_nmethod_or_null()->needs_stack_repair(), "unimplemented");
+  if (_cb->as_nmethod_or_null()->needs_stack_repair()) {
+    intptr_t* real_frame_size_addr = unextended_sp() + _cb->frame_size() - metadata_words_at_bottom - 1;
+    real_size = (*real_frame_size_addr / wordSize) + metadata_words_at_bottom;
+    return real_size != _cb->frame_size();
+  }
   real_size = _cb->frame_size();
   return false;
 }
