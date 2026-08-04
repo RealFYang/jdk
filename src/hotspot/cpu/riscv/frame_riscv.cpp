@@ -624,21 +624,6 @@ frame::frame(void* ptr_sp, void* ptr_fp, void* pc) : _on_heap(false) {
 
 #endif
 
-// Check for a method with scalarized inline type arguments that needs
-// a stack repair and return the repaired sender stack pointer.
-
-intptr_t* frame::repair_sender_sp(intptr_t* sender_sp, intptr_t** saved_fp_addr) const {
-  nmethod* nm = _cb->as_nmethod_or_null();
-  if (nm != nullptr && nm->needs_stack_repair()) {
-    intptr_t* sp_inc_addr = (intptr_t*) (saved_fp_addr - 1);
-    assert(*sp_inc_addr % StackAlignmentInBytes == 0, "sp_inc not aligned");
-    int real_frame_size = (*sp_inc_addr / wordSize) + metadata_words_at_bottom;
-    assert(real_frame_size >= _cb->frame_size() && real_frame_size <= 1000000, "invalid frame size");
-    sender_sp = unextended_sp() + real_frame_size;
-  }
-  return sender_sp;
-}
-
 intptr_t* frame::repair_sender_sp(nmethod* nm, intptr_t* sp, intptr_t** saved_fp_addr) {
   assert(nm != nullptr && nm->needs_stack_repair(), "");
   // RISC-V saved-FP/RA sit at sender_sp - 2/-1 and sp_inc at sender_sp - 3

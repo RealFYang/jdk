@@ -389,9 +389,25 @@ inline int frame::sender_sp_ret_address_offset() {
   return frame::sender_sp_offset - frame::return_addr_offset;
 }
 
-//------------------------------------------------------------------------------
-// frame::sender
-frame frame::sender(RegisterMap* map) const {
+// Check for a method with scalarized inline type arguments that needs
+// a stack repair and return the repaired sender stack pointer.
+ALWAYSINLINE intptr_t* frame::repair_sender_sp(intptr_t* sender_sp, intptr_t** saved_fp_addr) const {
+  nmethod* nm = _cb->as_nmethod_or_null();
+  if (nm != nullptr && nm->needs_stack_repair()) {
+    intptr_t* sp_inc_addr = (intptr_t*) (saved_fp_addr - 1);
+    assert(*sp_inc_addr % StackAlignmentInBytes == 0, "sp_inc not aligned");
+    int real_frame_size = (*sp_inc_addr / wordSize) + metadata_words_at_bottom;
+    assert(real_frame_size >= _cb->frame_size() && real_frame_size <= 1000000, "invalid frame size");
+    sender_sp = unextended_sp() + real_frame_size;
+  }
+  return sender_sp;
+}
+
+// This method can be on a hot path. Since Valhalla made it a bit bigger, compilers are
+// not as eager to inline it, but in some cases, it makes a significant difference.
+// Let's encourage the compiler to inline sender all the way to frame::repair_sender_sp.
+// through frame::sender_for_compiled_frame.
+ALWAYSINLINE frame frame::sender(RegisterMap* map) const {
   frame result = sender_raw(map);
 
   if (map->process_frames() && !map->in_cont()) {
@@ -406,7 +422,7 @@ frame frame::sender(RegisterMap* map) const {
 
 //------------------------------------------------------------------------------
 // frame::sender_raw
-frame frame::sender_raw(RegisterMap* map) const {
+ALWAYSINLINE frame frame::sender_raw(RegisterMap* map) const {
   // Default is we done have to follow them. The sender_for_xxx will
   // update it accordingly
   assert(map != nullptr, "map must be set");
@@ -442,7 +458,7 @@ frame frame::sender_raw(RegisterMap* map) const {
 
 //------------------------------------------------------------------------------
 // frame::sender_for_compiled_frame
-frame frame::sender_for_compiled_frame(RegisterMap* map) const {
+ALWAYSINLINE frame frame::sender_for_compiled_frame(RegisterMap* map) const {
   // we cannot rely upon the last fp having been saved to the thread
   // in C2 code but it will have been pushed onto the stack. so we
   // have to find it relative to the unextended sp
