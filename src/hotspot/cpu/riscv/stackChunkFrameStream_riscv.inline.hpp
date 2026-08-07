@@ -41,22 +41,19 @@ inline bool StackChunkFrameStream<frame_kind>::is_in_frame(void* p0) const {
       frame f = to_frame();
       bool augmented = f.was_augmented_on_entry(frame_size);
       if (!augmented) {
-        if (nm->is_compiled_by_c2()) {
-          // C2 caller, so frame was not extended and thus the
-          // size read from the frame does not include the arguments.
-          // Ideally we have to count the arg size for the scalarized
-          // convention. For now we include the size of the caller frame
-          // which would at least be equal to that.
-          RegisterMap map(nullptr,
-                          RegisterMap::UpdateMap::skip,
-                          RegisterMap::ProcessFrames::skip,
-                          RegisterMap::WalkContinuation::skip);
-          frame caller = to_frame().sender(&map);
-          assert(caller.is_compiled_frame() && caller.cb()->as_nmethod()->is_compiled_by_c2(), "needs stack repair but was not extended with c1/interpreter caller");
-          frame_size += (caller.real_fp() - caller.sp());
-        } else {
-          frame_size += nm->num_stack_arg_slots() * VMRegImpl::stack_slot_size >> LogBytesPerWord;
-        }
+        // Fix: C2 caller, so frame was not extended and thus the
+        // size read from the frame does not include the arguments.
+        // Ideally we have to count the arg size for the scalarized
+        // convention. For now we include the size of the caller frame
+        // which would at least be equal to that.
+        RegisterMap map(nullptr,
+                        RegisterMap::UpdateMap::skip,
+                        RegisterMap::ProcessFrames::skip,
+                        RegisterMap::WalkContinuation::skip);
+        frame caller = to_frame().sender(&map);
+        assert(caller.is_compiled_frame() && caller.cb()->as_nmethod()->is_compiled_by_c2(),
+               "needs stack repair but was not extended with c1/interpreter caller");
+        frame_size += (caller.real_fp() - caller.sp());
       }
     } else {
       frame_size += nm->num_stack_arg_slots() * VMRegImpl::stack_slot_size >> LogBytesPerWord;
