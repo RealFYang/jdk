@@ -640,8 +640,11 @@ intptr_t* frame::repair_sender_sp(nmethod* nm, intptr_t* sp, intptr_t** saved_fp
 }
 
 bool frame::was_augmented_on_entry(int& real_size) const {
-  assert(is_compiled_frame(), "");
-  if (_cb->as_nmethod_or_null()->needs_stack_repair()) {
+  assert(_cb != nullptr && _cb->is_nmethod(), "");
+  if (_cb->as_nmethod()->needs_stack_repair()) {
+    // The stack increment resides just below the saved FP on the stack and
+    // records the total frame size excluding the two words for saving FP and RA
+    // (see MacroAssembler::remove_frame).
     intptr_t* real_frame_size_addr = unextended_sp() + _cb->frame_size() - metadata_words_at_bottom - 1;
     real_size = (*real_frame_size_addr / wordSize) + metadata_words_at_bottom;
     return real_size != _cb->frame_size();
