@@ -31,6 +31,14 @@ opclass vmemA(indirect);
 
 source %{
 
+  static void vsetvli_if_needed(C2_MacroAssembler* masm, const MachNode* node) {
+    assert((node->flags() & Node::PD::Flag_rvv_simple) != 0, "only simple vector instructions");
+    if ((node->flags() & Node::PD::Flag_rvv_vsetvli_elided) == 0) {
+      const Node* shape = rvv_vsetvli_shape_node(node);
+      __ vsetvli_helper(Matcher::vector_element_basic_type(shape), Matcher::vector_length(shape));
+    }
+  }
+
   static void loadStore(C2_MacroAssembler* masm, bool is_store,
                         VectorRegister reg, BasicType bt, Register base,
                         uint vector_length, Assembler::VectorMask vm = Assembler::unmasked) {
@@ -192,22 +200,30 @@ source %{
 // vector load/store
 instruct loadV(vReg dst, vmemA mem) %{
   match(Set dst (LoadVector mem));
-  format %{ "loadV $dst, $mem\t# vector (rvv)" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"loadV $dst, $mem\t# vector (rvv)"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    VectorRegister dst_reg = as_VectorRegister($dst$$reg);
-    loadStore(masm, false, dst_reg,
-              Matcher::vector_element_basic_type(this), as_Register($mem$$base), Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
+    Assembler::SEW sew = Assembler::elemtype_to_sew(Matcher::vector_element_basic_type(this));
+    __ vlex_v(as_VectorRegister($dst$$reg), as_Register($mem$$base), sew);
   %}
   ins_pipe(pipe_slow);
 %}
 
 instruct storeV(vReg src, vmemA mem) %{
   match(Set mem (StoreVector mem src));
-  format %{ "storeV $mem, $src\t# vector (rvv)" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"storeV $mem, $src\t# vector (rvv)"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    VectorRegister src_reg = as_VectorRegister($src$$reg);
-    loadStore(masm, true, src_reg,
-              Matcher::vector_element_basic_type(this, $src), as_Register($mem$$base), Matcher::vector_length(this, $src));
+    vsetvli_if_needed(masm, this);
+    Assembler::SEW sew = Assembler::elemtype_to_sew(Matcher::vector_element_basic_type(this, $src));
+    __ vsex_v(as_VectorRegister($src$$reg), as_Register($mem$$base), sew);
   %}
   ins_pipe(pipe_slow);
 %}
@@ -324,11 +340,14 @@ instruct vabs(vReg dst, vReg src, vReg tmp) %{
   match(Set dst (AbsVS src));
   match(Set dst (AbsVI src));
   match(Set dst (AbsVL src));
+  flag(PD::Flag_rvv_simple);
   effect(TEMP tmp);
-  format %{ "vabs $dst, $src\t# KILL $tmp" %}
+  format %{ $$template
+    $$emit$$"vabs $dst, $src\t# KILL $tmp"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vrsub_vi(as_VectorRegister($tmp$$reg), as_VectorRegister($src$$reg), 0);
     __ vmax_vv(as_VectorRegister($dst$$reg), as_VectorRegister($tmp$$reg), as_VectorRegister($src$$reg));
   %}
@@ -338,10 +357,13 @@ instruct vabs(vReg dst, vReg src, vReg tmp) %{
 instruct vabs_fp(vReg dst, vReg src) %{
   match(Set dst (AbsVF src));
   match(Set dst (AbsVD src));
-  format %{ "vabs_fp $dst, $src" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vabs_fp $dst, $src"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vfabs_v(as_VectorRegister($dst$$reg), as_VectorRegister($src$$reg));
   %}
   ins_pipe(pipe_slow);
@@ -386,10 +408,13 @@ instruct vadd(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (AddVS src1 src2));
   match(Set dst (AddVI src1 src2));
   match(Set dst (AddVL src1 src2));
-  format %{ "vadd $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vadd $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vadd_vv(as_VectorRegister($dst$$reg),
                as_VectorRegister($src1$$reg),
                as_VectorRegister($src2$$reg));
@@ -414,10 +439,13 @@ instruct vadd_hfp(vReg dst, vReg src1, vReg src2) %{
 instruct vadd_fp(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (AddVF src1 src2));
   match(Set dst (AddVD src1 src2));
-  format %{ "vadd_fp $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vadd_fp $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vfadd_vv(as_VectorRegister($dst$$reg),
                 as_VectorRegister($src1$$reg),
                 as_VectorRegister($src2$$reg));
@@ -580,10 +608,13 @@ instruct vsub(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (SubVS src1 src2));
   match(Set dst (SubVI src1 src2));
   match(Set dst (SubVL src1 src2));
-  format %{ "vsub $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vsub $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vsub_vv(as_VectorRegister($dst$$reg), as_VectorRegister($src1$$reg),
                as_VectorRegister($src2$$reg));
   %}
@@ -606,10 +637,13 @@ instruct vsub_hfp(vReg dst, vReg src1, vReg src2) %{
 instruct vsub_fp(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (SubVF src1 src2));
   match(Set dst (SubVD src1 src2));
-  format %{ "vsub_fp $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vsub_fp $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vfsub_vv(as_VectorRegister($dst$$reg), as_VectorRegister($src1$$reg),
                 as_VectorRegister($src2$$reg));
   %}
@@ -838,10 +872,13 @@ instruct vssubu_masked(vReg dst_src, vReg src1, vRegMask_V0 v0) %{
 
 instruct vand(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (AndV src1 src2));
-  format %{ "vand $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vand $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vand_vv(as_VectorRegister($dst$$reg),
                as_VectorRegister($src1$$reg),
                as_VectorRegister($src2$$reg));
@@ -992,10 +1029,13 @@ instruct vandL_vx_masked(vReg dst_src, iRegL src, vRegMask_V0 v0) %{
 
 instruct vor(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (OrV src1 src2));
-  format %{ "vor $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vor $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vor_vv(as_VectorRegister($dst$$reg),
               as_VectorRegister($src1$$reg),
               as_VectorRegister($src2$$reg));
@@ -1146,10 +1186,13 @@ instruct vorL_vx_masked(vReg dst_src, iRegL src, vRegMask_V0 v0) %{
 
 instruct vxor(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (XorV src1 src2));
-  format %{ "vxor $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vxor $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vxor_vv(as_VectorRegister($dst$$reg),
                as_VectorRegister($src1$$reg),
                as_VectorRegister($src2$$reg));
@@ -1668,10 +1711,13 @@ instruct vmax(vReg dst, vReg src1, vReg src2) %{
   predicate(Matcher::vector_element_basic_type(n) != T_FLOAT &&
             Matcher::vector_element_basic_type(n) != T_DOUBLE);
   match(Set dst (MaxV src1 src2));
-  format %{ "vmax $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vmax $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vmax_vv(as_VectorRegister($dst$$reg),
                as_VectorRegister($src1$$reg), as_VectorRegister($src2$$reg));
   %}
@@ -1682,10 +1728,13 @@ instruct vmin(vReg dst, vReg src1, vReg src2) %{
   predicate(Matcher::vector_element_basic_type(n) != T_FLOAT &&
             Matcher::vector_element_basic_type(n) != T_DOUBLE);
   match(Set dst (MinV src1 src2));
-  format %{ "vmin $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vmin $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vmin_vv(as_VectorRegister($dst$$reg),
                as_VectorRegister($src1$$reg), as_VectorRegister($src2$$reg));
   %}
@@ -1726,11 +1775,14 @@ instruct vmin_masked(vReg dst_src1, vReg src2, vRegMask_V0 v0) %{
 
 instruct vmaxu(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (UMaxV src1 src2));
-  format %{ "vmaxu $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vmaxu $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    assert(is_integral_type(bt), "unsupported type");
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    assert(is_integral_type(Matcher::vector_element_basic_type(this)), "unsupported type");
+    vsetvli_if_needed(masm, this);
     __ vmaxu_vv(as_VectorRegister($dst$$reg),
                 as_VectorRegister($src1$$reg), as_VectorRegister($src2$$reg));
   %}
@@ -1739,11 +1791,14 @@ instruct vmaxu(vReg dst, vReg src1, vReg src2) %{
 
 instruct vminu(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (UMinV src1 src2));
-  format %{ "vminu $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vminu $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    assert(is_integral_type(bt), "unsupported type");
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    assert(is_integral_type(Matcher::vector_element_basic_type(this)), "unsupported type");
+    vsetvli_if_needed(masm, this);
     __ vminu_vv(as_VectorRegister($dst$$reg),
                 as_VectorRegister($src1$$reg), as_VectorRegister($src2$$reg));
   %}
@@ -2139,10 +2194,13 @@ instruct vmul(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (MulVS src1 src2));
   match(Set dst (MulVI src1 src2));
   match(Set dst (MulVL src1 src2));
-  format %{ "vmul $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vmul $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vmul_vv(as_VectorRegister($dst$$reg), as_VectorRegister($src1$$reg),
                as_VectorRegister($src2$$reg));
   %}
@@ -2165,10 +2223,13 @@ instruct vmul_hfp(vReg dst, vReg src1, vReg src2) %{
 instruct vmul_fp(vReg dst, vReg src1, vReg src2) %{
   match(Set dst (MulVF src1 src2));
   match(Set dst (MulVD src1 src2));
-  format %{ "vmul_fp $dst, $src1, $src2" %}
+  flag(PD::Flag_rvv_simple);
+  format %{ $$template
+    $$emit$$"vmul_fp $dst, $src1, $src2"
+    st->print(" # rvv_vsetvli=%s", (flags() & PD::Flag_rvv_vsetvli_elided) != 0 ? "elided" : "kept");
+  %}
   ins_encode %{
-    BasicType bt = Matcher::vector_element_basic_type(this);
-    __ vsetvli_helper(bt, Matcher::vector_length(this));
+    vsetvli_if_needed(masm, this);
     __ vfmul_vv(as_VectorRegister($dst$$reg), as_VectorRegister($src1$$reg),
                 as_VectorRegister($src2$$reg));
   %}
